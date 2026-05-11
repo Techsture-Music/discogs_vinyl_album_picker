@@ -36,9 +36,10 @@ DISCOGS_API = "https://api.discogs.com"
 HISTORY_FILE = Path(__file__).resolve().parent / "discogs_wall_history.json"
 USER_AGENT = "VinylWallPicker/1.0"
 DEFAULT_COUNT = 24
-DEFAULT_FORMATS = ["Vinyl"]   # case-insensitive; [] = no filter (any format)
-COOLDOWN_PICKS = 3            # how many recent picks are "on cooldown"
-HISTORY_KEEP = 10             # keep this many past picks in the file
+DEFAULT_FORMATS = ["Vinyl"]              # case-insensitive; [] = no filter (any format)
+DEFAULT_EXCLUDE_FORMATS = ["Box Set"]    # always-removed formats; won't fit on shallow shelves
+COOLDOWN_PICKS = 3                       # how many recent picks are "on cooldown"
+HISTORY_KEEP = 10                        # keep this many past picks in the file
 
 
 def fetch_collection(username: str, token: str) -> list[dict]:
@@ -58,12 +59,14 @@ def fetch_collection(username: str, token: str) -> list[dict]:
         for r in data.get("releases", []):
             info = r.get("basic_information", {})
             artists = ", ".join(a["name"] for a in info.get("artists", []))
+            formats_raw = info.get("formats", [])
             releases.append({
                 "id": r["id"],
                 "artist": artists,
                 "title": info.get("title", ""),
                 "year": info.get("year", 0),
-                "formats": [f.get("name", "") for f in info.get("formats", [])],
+                "formats": [f.get("name", "") for f in formats_raw],
+                "format_descriptions": [d for f in formats_raw for d in f.get("descriptions", [])],
                 "url": f"https://www.discogs.com/release/{r['id']}",
             })
 
@@ -82,6 +85,19 @@ def filter_by_format(releases: list[dict], formats: list[str]) -> list[dict]:
         return releases
     wanted = {f.lower() for f in formats}
     return [r for r in releases if wanted & {f.lower() for f in r["formats"]}]
+
+
+def exclude_by_format(releases: list[dict], formats: list[str]) -> list[dict]:
+    """Drop releases whose format names or descriptions contain any of the given names."""
+    if not formats:
+        return releases
+    unwanted = {f.lower() for f in formats}
+
+    def matches(r: dict) -> bool:
+        tags = {t.lower() for t in r["formats"]} | {t.lower() for t in r.get("format_descriptions", [])}
+        return bool(unwanted & tags)
+
+    return [r for r in releases if not matches(r)]
 
 
 def normalize_artist(name: str) -> str:
@@ -163,6 +179,12 @@ def main() -> None:
              'Default: "Vinyl". Use "" or "any" for no filter. '
              'Examples: "Vinyl", "Vinyl,Cassette", "CD".',
     )
+    parser.add_argument(
+        "--exclude-formats",
+        default=",".join(DEFAULT_EXCLUDE_FORMATS),
+        help='Comma-separated format names to exclude (case-insensitive). '
+             'Default: "Box Set". Use "" to exclude nothing.',
+    )
     parser.add_argument("--no-history", action="store_true",
                         help="Don't filter by display history (pure random).")
     parser.add_argument("--reset-history", action="store_true",
@@ -195,6 +217,14 @@ def main() -> None:
     if formats:
         releases = filter_by_format(releases, formats)
         print(f"{len(releases)} match format filter: {', '.join(formats)}")
+
+    exclude_formats = [f.strip() for f in args.exclude_formats.split(",") if f.strip()]
+    if exclude_formats:
+        before = len(releases)
+        releases = exclude_by_format(releases, exclude_formats)
+        dropped = before - len(releases)
+        if dropped:
+            print(f"Excluded {dropped} ({', '.join(exclude_formats)}); {len(releases)} remaining.")
     print()
 
     if len(releases) < args.count:
