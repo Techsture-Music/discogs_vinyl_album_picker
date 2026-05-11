@@ -84,6 +84,19 @@ def filter_by_format(releases: list[dict], formats: list[str]) -> list[dict]:
     return [r for r in releases if wanted & {f.lower() for f in r["formats"]}]
 
 
+def normalize_artist(name: str) -> str:
+    """Strip a leading 'The ' so sorting/grouping treats 'The Beatles' as 'Beatles'."""
+    n = name.strip()
+    if n.lower().startswith("the "):
+        n = n[4:]
+    return n
+
+
+def album_key(release: dict) -> tuple[str, str]:
+    """Identity for an album regardless of pressing/color variant."""
+    return (normalize_artist(release["artist"]).lower(), release["title"].strip().lower())
+
+
 def load_history() -> dict:
     if HISTORY_FILE.exists():
         try:
@@ -105,17 +118,34 @@ def recently_displayed(history: dict, cooldown: int = COOLDOWN_PICKS) -> set[int
 
 
 def pick_albums(releases: list[dict], count: int, history: dict) -> list[dict]:
-    """Pick `count` releases, preferring ones not in recent rotation."""
+    """Pick `count` releases, preferring ones not in recent rotation.
+
+    Two releases with the same (artist, title) — e.g. black vs. colored pressings
+    of the same album — count as one candidate. One pressing is picked at random
+    for that album.
+    """
     recent = recently_displayed(history)
     fresh = [r for r in releases if r["id"] not in recent]
 
-    if len(fresh) >= count:
-        return random.sample(fresh, count)
+    def sample_unique_albums(pool: list[dict], n: int) -> list[dict]:
+        """Sample n releases such that no two share the same album_key."""
+        by_album: dict[tuple[str, str], list[dict]] = {}
+        for r in pool:
+            by_album.setdefault(album_key(r), []).append(r)
+        keys = list(by_album.keys())
+        chosen = random.sample(keys, min(n, len(keys)))
+        return [random.choice(by_album[k]) for k in chosen]
 
-    # Not enough fresh ones — take all fresh, fill the rest from the cooldown pool.
-    leftover = [r for r in releases if r["id"] in recent]
-    picks = fresh + random.sample(leftover, count - len(fresh))
-    random.shuffle(picks)
+    picks = sample_unique_albums(fresh, count)
+
+    if len(picks) < count:
+        # Not enough unique fresh albums — fill from the cooldown pool,
+        # avoiding albums already in `picks`.
+        already = {album_key(r) for r in picks}
+        leftover = [r for r in releases if album_key(r) not in already]
+        picks.extend(sample_unique_albums(leftover, count - len(picks)))
+        random.shuffle(picks)
+
     return picks
 
 
@@ -173,7 +203,7 @@ def main() -> None:
 
     history = load_history() if not args.no_history else {"picks": []}
     picks = pick_albums(releases, args.count, history)
-    picks.sort(key=lambda r: r["artist"].lower())
+    picks.sort(key=lambda r: normalize_artist(r["artist"]).lower())
 
     print(f"=== {len(picks)} albums for the wall ===\n")
     for i, r in enumerate(picks, 1):
