@@ -173,6 +173,7 @@ def main() -> None:
 
     history = load_history() if not args.no_history else {"picks": []}
     picks = pick_albums(releases, args.count, history)
+    picks.sort(key=lambda r: r["artist"].lower())
 
     print(f"=== {len(picks)} albums for the wall ===\n")
     for i, r in enumerate(picks, 1):
@@ -196,4 +197,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    
