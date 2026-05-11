@@ -60,11 +60,12 @@ def fetch_collection(username: str, token: str) -> list[dict]:
 
         for r in data.get("releases", []):
             info = r.get("basic_information", {})
-            artists = ", ".join(a["name"] for a in info.get("artists", []))
+            artists_list = [a["name"] for a in info.get("artists", [])]
             formats_raw = info.get("formats", [])
             releases.append({
                 "id": r["id"],
-                "artist": artists,
+                "artist": ", ".join(artists_list),
+                "artists": artists_list,
                 "title": info.get("title", ""),
                 "year": info.get("year", 0),
                 "formats": [f.get("name", "") for f in formats_raw],
@@ -127,9 +128,14 @@ def normalize_artist(name: str) -> str:
     return n
 
 
-def album_key(release: dict) -> tuple[str, str]:
-    """Identity for an album regardless of pressing/color variant."""
-    return (normalize_artist(release["artist"]).lower(), release["title"].strip().lower())
+def artist_key(release: dict) -> str:
+    """Identity for the primary artist. Used to prevent same-artist duplicates on the wall.
+
+    Also subsumes album-level dedup: two pressings of the same album necessarily
+    share an artist, so they can't both be picked.
+    """
+    primary = release["artists"][0] if release.get("artists") else release.get("artist", "")
+    return normalize_artist(primary).lower()
 
 
 def load_history() -> dict:
@@ -155,30 +161,32 @@ def recently_displayed(history: dict, cooldown: int = COOLDOWN_PICKS) -> set[int
 def pick_albums(releases: list[dict], count: int, history: dict) -> list[dict]:
     """Pick `count` releases, preferring ones not in recent rotation.
 
-    Two releases with the same (artist, title) — e.g. black vs. colored pressings
-    of the same album — count as one candidate. One pressing is picked at random
-    for that album.
+    Constraints:
+    - No two releases share a primary artist (so no two records by the same artist
+      end up on the wall at once).
+    - This also rules out duplicate albums (e.g. multiple pressings of one title),
+      since two pressings of the same album necessarily share an artist.
     """
     recent = recently_displayed(history)
     fresh = [r for r in releases if r["id"] not in recent]
 
-    def sample_unique_albums(pool: list[dict], n: int) -> list[dict]:
-        """Sample n releases such that no two share the same album_key."""
-        by_album: dict[tuple[str, str], list[dict]] = {}
+    def sample_unique_artists(pool: list[dict], n: int) -> list[dict]:
+        """Sample n releases such that no two share the same primary artist."""
+        by_artist: dict[str, list[dict]] = {}
         for r in pool:
-            by_album.setdefault(album_key(r), []).append(r)
-        keys = list(by_album.keys())
+            by_artist.setdefault(artist_key(r), []).append(r)
+        keys = list(by_artist.keys())
         chosen = random.sample(keys, min(n, len(keys)))
-        return [random.choice(by_album[k]) for k in chosen]
+        return [random.choice(by_artist[k]) for k in chosen]
 
-    picks = sample_unique_albums(fresh, count)
+    picks = sample_unique_artists(fresh, count)
 
     if len(picks) < count:
-        # Not enough unique fresh albums — fill from the cooldown pool,
-        # avoiding albums already in `picks`.
-        already = {album_key(r) for r in picks}
-        leftover = [r for r in releases if album_key(r) not in already]
-        picks.extend(sample_unique_albums(leftover, count - len(picks)))
+        # Not enough unique artists in fresh pool — fill from cooldown,
+        # avoiding artists already represented in picks.
+        already = {artist_key(r) for r in picks}
+        leftover = [r for r in releases if artist_key(r) not in already]
+        picks.extend(sample_unique_artists(leftover, count - len(picks)))
         random.shuffle(picks)
 
     return picks
