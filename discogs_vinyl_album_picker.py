@@ -38,6 +38,8 @@ USER_AGENT = "VinylWallPicker/1.0"
 DEFAULT_COUNT = 24
 DEFAULT_FORMATS = ["Vinyl"]              # case-insensitive; [] = no filter (any format)
 DEFAULT_EXCLUDE_FORMATS = ["Box Set"]    # always-removed formats; won't fit on shallow shelves
+DEFAULT_FIELD_NAME = "Wall Display"      # Discogs custom field controlling inclusion
+DEFAULT_FIELD_VALUE = "Yes"              # the value required to be included
 COOLDOWN_PICKS = 3                       # how many recent picks are "on cooldown"
 HISTORY_KEEP = 10                        # keep this many past picks in the file
 
@@ -67,6 +69,7 @@ def fetch_collection(username: str, token: str) -> list[dict]:
                 "year": info.get("year", 0),
                 "formats": [f.get("name", "") for f in formats_raw],
                 "format_descriptions": [d for f in formats_raw for d in f.get("descriptions", [])],
+                "notes": {n["field_id"]: n.get("value", "") for n in r.get("notes", [])},
                 "url": f"https://www.discogs.com/release/{r['id']}",
             })
 
@@ -77,6 +80,22 @@ def fetch_collection(username: str, token: str) -> list[dict]:
         time.sleep(1)  # be polite to the API
 
     return releases
+
+
+def fetch_collection_fields(username: str, token: str) -> dict[str, int]:
+    """Fetch the user's custom collection fields. Returns {field_name: field_id}."""
+    url = f"{DISCOGS_API}/users/{username}/collection/fields"
+    headers = {"User-Agent": USER_AGENT}
+    params = {"token": token}
+    resp = requests.get(url, headers=headers, params=params, timeout=30)
+    resp.raise_for_status()
+    return {f["name"]: f["id"] for f in resp.json().get("fields", [])}
+
+
+def filter_by_field(releases: list[dict], field_id: int, required_value: str) -> list[dict]:
+    """Keep releases whose custom field equals required_value (case-insensitive)."""
+    target = required_value.strip().lower()
+    return [r for r in releases if r["notes"].get(field_id, "").strip().lower() == target]
 
 
 def filter_by_format(releases: list[dict], formats: list[str]) -> list[dict]:
@@ -185,6 +204,12 @@ def main() -> None:
         help='Comma-separated format names to exclude (case-insensitive). '
              'Default: "Box Set". Use "" to exclude nothing.',
     )
+    parser.add_argument(
+        "--ignore-wall-display",
+        action="store_true",
+        help=f'Skip the "{DEFAULT_FIELD_NAME}" custom field filter. '
+             f'By default, only releases tagged "{DEFAULT_FIELD_NAME}" = "{DEFAULT_FIELD_VALUE}" are eligible.',
+    )
     parser.add_argument("--no-history", action="store_true",
                         help="Don't filter by display history (pure random).")
     parser.add_argument("--reset-history", action="store_true",
@@ -225,6 +250,18 @@ def main() -> None:
         dropped = before - len(releases)
         if dropped:
             print(f"Excluded {dropped} ({', '.join(exclude_formats)}); {len(releases)} remaining.")
+
+    if not args.ignore_wall_display:
+        fields = fetch_collection_fields(args.username, args.token)
+        field_id = fields.get(DEFAULT_FIELD_NAME)
+        if field_id is None:
+            print(f'Warning: no custom field named "{DEFAULT_FIELD_NAME}" found. '
+                  f'Skipping field filter — pass --ignore-wall-display to silence this.')
+        else:
+            before = len(releases)
+            releases = filter_by_field(releases, field_id, DEFAULT_FIELD_VALUE)
+            print(f'{len(releases)} have "{DEFAULT_FIELD_NAME}" = "{DEFAULT_FIELD_VALUE}" '
+                  f'(filtered out {before - len(releases)}).')
     print()
 
     if len(releases) < args.count:
