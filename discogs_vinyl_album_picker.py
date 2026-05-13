@@ -23,17 +23,21 @@ Usage:
 Get a token at: https://www.discogs.com/settings/developers
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
 import random
 import time
+from datetime import date
 from pathlib import Path
 
 import requests
 
 DISCOGS_API = "https://api.discogs.com"
 HISTORY_FILE = Path(__file__).resolve().parent / "discogs_wall_history.json"
+CACHE_FILE = Path(__file__).resolve().parent / "discogs_collection_cache.json"
 USER_AGENT = "VinylWallPicker/1.0"
 DEFAULT_COUNT = 24
 DEFAULT_FORMATS = ["Vinyl"]              # case-insensitive; [] = no filter (any format)
@@ -70,7 +74,7 @@ def fetch_collection(username: str, token: str) -> list[dict]:
                 "year": info.get("year", 0),
                 "formats": [f.get("name", "") for f in formats_raw],
                 "format_descriptions": [d for f in formats_raw for d in f.get("descriptions", [])],
-                "notes": {n["field_id"]: n.get("value", "") for n in r.get("notes", [])},
+                "notes": {str(n["field_id"]): n.get("value", "") for n in r.get("notes", [])},
                 "url": f"https://www.discogs.com/release/{r['id']}",
             })
 
@@ -95,8 +99,9 @@ def fetch_collection_fields(username: str, token: str) -> dict[str, int]:
 
 def filter_by_field(releases: list[dict], field_id: int, required_value: str) -> list[dict]:
     """Keep releases whose custom field equals required_value (case-insensitive)."""
+    key = str(field_id)
     target = required_value.strip().lower()
-    return [r for r in releases if r["notes"].get(field_id, "").strip().lower() == target]
+    return [r for r in releases if r["notes"].get(key, "").strip().lower() == target]
 
 
 def filter_by_format(releases: list[dict], formats: list[str]) -> list[dict]:
@@ -149,6 +154,26 @@ def load_history() -> dict:
 
 def save_history(history: dict) -> None:
     HISTORY_FILE.write_text(json.dumps(history, indent=2))
+
+
+def load_cache() -> list[dict] | None:
+    """Return today's cached collection, or None if missing/stale/corrupt."""
+    if not CACHE_FILE.exists():
+        return None
+    try:
+        data = json.loads(CACHE_FILE.read_text())
+        if data.get("date") == date.today().isoformat():
+            return data.get("releases")
+    except (json.JSONDecodeError, KeyError):
+        pass
+    return None
+
+
+def save_cache(releases: list[dict]) -> None:
+    CACHE_FILE.write_text(json.dumps({
+        "date": date.today().isoformat(),
+        "releases": releases,
+    }, indent=2))
 
 
 def recently_displayed(history: dict, cooldown: int = COOLDOWN_PICKS) -> set[int]:
@@ -218,6 +243,11 @@ def main() -> None:
         help=f'Skip the "{DEFAULT_FIELD_NAME}" custom field filter. '
              f'By default, only releases tagged "{DEFAULT_FIELD_NAME}" = "{DEFAULT_FIELD_VALUE}" are eligible.',
     )
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Force a fresh fetch from Discogs and overwrite today's cache.",
+    )
     parser.add_argument("--no-history", action="store_true",
                         help="Don't filter by display history (pure random).")
     parser.add_argument("--reset-history", action="store_true",
@@ -238,9 +268,17 @@ def main() -> None:
             "Need --username and --token (or DISCOGS_USERNAME / DISCOGS_TOKEN env vars)."
         )
 
-    print(f"Fetching collection for {args.username}...")
-    releases = fetch_collection(args.username, args.token)
-    print(f"Found {len(releases)} releases in collection.")
+    cached = None if args.refresh else load_cache()
+    using_cache = cached is not None
+    if using_cache:
+        releases = cached
+        print(f"Using cached collection from today ({len(releases)} releases). "
+              f"Use --refresh to re-fetch.")
+    else:
+        print(f"Fetching collection for {args.username}...")
+        releases = fetch_collection(args.username, args.token)
+        save_cache(releases)
+        print(f"Found {len(releases)} releases in collection. (Cached for today.)")
 
     if args.formats.strip().lower() in ("", "any"):
         formats = []
@@ -270,6 +308,9 @@ def main() -> None:
             releases = filter_by_field(releases, field_id, DEFAULT_FIELD_VALUE)
             print(f'{len(releases)} have "{DEFAULT_FIELD_NAME}" = "{DEFAULT_FIELD_VALUE}" '
                   f'(filtered out {before - len(releases)}).')
+            if len(releases) == 0 and using_cache:
+                print('Hint: if you recently tagged releases on Discogs, '
+                      'run with --refresh to update the cache.')
     print()
 
     if len(releases) < args.count:
