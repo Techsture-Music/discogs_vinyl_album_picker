@@ -30,7 +30,7 @@ import json
 import os
 import random
 import time
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import requests
@@ -44,8 +44,7 @@ DEFAULT_FORMATS = ["Vinyl"]              # case-insensitive; [] = no filter (any
 DEFAULT_EXCLUDE_FORMATS = ["Box Set"]    # always-removed formats; won't fit on shallow shelves
 DEFAULT_FIELD_NAME = "Wall Display"      # Discogs custom field controlling inclusion
 DEFAULT_FIELD_VALUE = "Yes"              # the value required to be included
-COOLDOWN_PICKS = 3                       # how many recent picks are "on cooldown"
-HISTORY_KEEP = 10                        # keep this many past picks in the file
+DEFAULT_COOLDOWN_DAYS = 90               # days an album stays out of rotation after display
 
 
 def fetch_collection(username: str, token: str) -> list[dict]:
@@ -144,16 +143,54 @@ def artist_key(release: dict) -> str:
 
 
 def load_history() -> dict:
-    if HISTORY_FILE.exists():
-        try:
-            return json.loads(HISTORY_FILE.read_text())
-        except json.JSONDecodeError:
-            pass
-    return {"picks": []}
+    """History schema: {'displayed': {release_id_str: 'YYYY-MM-DD'}}.
+
+    Migrates the older {'picks': [[id, ...], ...]} schema by marking every
+    id in it as displayed today (the safest assumption — keeps recently-shown
+    records on cooldown for the full window).
+    """
+    if not HISTORY_FILE.exists():
+        return {"displayed": {}}
+    try:
+        data = json.loads(HISTORY_FILE.read_text())
+    except json.JSONDecodeError:
+        return {"displayed": {}}
+
+    if "displayed" in data:
+        return {"displayed": data["displayed"]}
+
+    if "picks" in data:
+        today = date.today().isoformat()
+        displayed = {}
+        for pick in data["picks"]:
+            for release_id in pick:
+                displayed[str(release_id)] = today
+        if displayed:
+            print(f"Migrated {len(displayed)} releases from old history format "
+                  f"(all marked as displayed today).")
+        return {"displayed": displayed}
+
+    return {"displayed": {}}
 
 
 def save_history(history: dict) -> None:
     HISTORY_FILE.write_text(json.dumps(history, indent=2))
+
+
+def recently_displayed(history: dict, cooldown_days: int) -> set[str]:
+    """Set of release IDs (as strings) currently within the cooldown window."""
+    if cooldown_days <= 0:
+        return set()
+    cutoff = date.today() - timedelta(days=cooldown_days)
+    recent = set()
+    for release_id, iso in history["displayed"].items():
+        try:
+            d = date.fromisoformat(iso)
+        except (ValueError, TypeError):
+            continue
+        if d >= cutoff:
+            recent.add(release_id)
+    return recent
 
 
 def load_cache() -> list[dict] | None:
@@ -176,15 +213,8 @@ def save_cache(releases: list[dict]) -> None:
     }, indent=2))
 
 
-def recently_displayed(history: dict, cooldown: int = COOLDOWN_PICKS) -> set[int]:
-    recent = set()
-    for picks in history["picks"][-cooldown:]:
-        recent.update(picks)
-    return recent
-
-
-def pick_albums(releases: list[dict], count: int, history: dict) -> list[dict]:
-    """Pick `count` releases, preferring ones not in recent rotation.
+def pick_albums(releases: list[dict], count: int, history: dict, cooldown_days: int) -> list[dict]:
+    """Pick `count` releases, preferring ones outside the cooldown window.
 
     Constraints:
     - No two releases share a primary artist (so no two records by the same artist
@@ -192,8 +222,8 @@ def pick_albums(releases: list[dict], count: int, history: dict) -> list[dict]:
     - This also rules out duplicate albums (e.g. multiple pressings of one title),
       since two pressings of the same album necessarily share an artist.
     """
-    recent = recently_displayed(history)
-    fresh = [r for r in releases if r["id"] not in recent]
+    recent = recently_displayed(history, cooldown_days)
+    fresh = [r for r in releases if str(r["id"]) not in recent]
 
     def sample_unique_artists(pool: list[dict], n: int) -> list[dict]:
         """Sample n releases such that no two share the same primary artist."""
@@ -247,6 +277,13 @@ def main() -> None:
         "--refresh",
         action="store_true",
         help="Force a fresh fetch from Discogs and overwrite today's cache.",
+    )
+    parser.add_argument(
+        "--cooldown-days",
+        type=int,
+        default=DEFAULT_COOLDOWN_DAYS,
+        help=f"Days a displayed album stays out of rotation (default: {DEFAULT_COOLDOWN_DAYS}). "
+             "Use 0 to disable cooldown entirely.",
     )
     parser.add_argument("--no-history", action="store_true",
                         help="Don't filter by display history (pure random).")
@@ -317,8 +354,8 @@ def main() -> None:
         print(f"Only {len(releases)} releases in collection — picking all of them.")
         args.count = len(releases)
 
-    history = load_history() if not args.no_history else {"picks": []}
-    picks = pick_albums(releases, args.count, history)
+    history = load_history() if not args.no_history else {"displayed": {}}
+    picks = pick_albums(releases, args.count, history, args.cooldown_days)
     picks.sort(key=lambda r: normalize_artist(r["artist"]).lower())
 
     print(f"=== {len(picks)} albums for the wall ===\n")
@@ -329,12 +366,16 @@ def main() -> None:
         print(f"    {r['url']}")
 
     if not args.no_history:
-        history["picks"].append([r["id"] for r in picks])
-        history["picks"] = history["picks"][-HISTORY_KEEP:]
+        today = date.today().isoformat()
+        for r in picks:
+            history["displayed"][str(r["id"])] = today
         save_history(history)
-        cooldown_count = len(recently_displayed(history))
+        cooldown_count = len(recently_displayed(history, args.cooldown_days))
         print(f"\nHistory saved to {HISTORY_FILE}")
-        print(f"{cooldown_count} albums now on cooldown for the next pick.")
+        if args.cooldown_days > 0:
+            print(f"{cooldown_count} albums on cooldown (displayed within last {args.cooldown_days} days).")
+        else:
+            print("Cooldown disabled.")
 
     if args.output:
         Path(args.output).write_text(json.dumps(picks, indent=2))
