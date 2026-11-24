@@ -29,11 +29,17 @@ import argparse
 import json
 import os
 import random
+import re
 import time
 from datetime import date, timedelta
 from pathlib import Path
 
 import requests
+import urllib3.util.connection
+
+# IPv6 connections to api.discogs.com hang on this network until the 30s timeout
+# before falling back to IPv4, so a full collection fetch took 10+ minutes.
+urllib3.util.connection.HAS_IPV6 = False
 
 DISCOGS_API = "https://api.discogs.com"
 HISTORY_FILE = Path(__file__).resolve().parent / "discogs_wall_history.json"
@@ -45,6 +51,9 @@ DEFAULT_EXCLUDE_FORMATS = ["Box Set"]    # always-removed formats; won't fit on 
 DEFAULT_FIELD_NAME = "Wall Display"      # Discogs custom field controlling inclusion
 DEFAULT_FIELD_VALUE = "Yes"              # the value required to be included
 DEFAULT_COOLDOWN_DAYS = 90               # days an album stays out of rotation after display
+DOWNSTAIRS_WORD = "downstairs"           # note text marking records kept in the sitting-room cabinet
+LOCATION_DOWNSTAIRS = "Downstairs"
+LOCATION_OFFICE = "Office"
 
 
 def fetch_collection(username: str, token: str) -> list[dict]:
@@ -101,6 +110,27 @@ def filter_by_field(releases: list[dict], field_id: int, required_value: str) ->
     key = str(field_id)
     target = required_value.strip().lower()
     return [r for r in releases if r["notes"].get(key, "").strip().lower() == target]
+
+
+def is_downstairs(release: dict, downstairs_field_id: int | None = None) -> bool:
+    """True if the release lives in the sitting-room cabinet rather than the office.
+
+    Matches either the word "downstairs" in any note/custom-field value (e.g. the
+    free-text Notes field), or any non-blank, non-"no" value in a custom field
+    named "Downstairs".
+    """
+    pattern = re.compile(rf"\b{DOWNSTAIRS_WORD}\b", re.IGNORECASE)
+    notes = release.get("notes", {})
+    if any(pattern.search(v or "") for v in notes.values()):
+        return True
+    if downstairs_field_id is not None:
+        value = notes.get(str(downstairs_field_id), "").strip().lower()
+        return value not in ("", "no", "n", "false", "0")
+    return False
+
+
+def location(release: dict, downstairs_field_id: int | None = None) -> str:
+    return LOCATION_DOWNSTAIRS if is_downstairs(release, downstairs_field_id) else LOCATION_OFFICE
 
 
 def filter_by_format(releases: list[dict], formats: list[str]) -> list[dict]:
@@ -334,8 +364,12 @@ def main() -> None:
         if dropped:
             print(f"Excluded {dropped} ({', '.join(exclude_formats)}); {len(releases)} remaining.")
 
+    fields = fetch_collection_fields(args.username, args.token)
+    downstairs_field_id = next(
+        (fid for name, fid in fields.items() if name.strip().lower() == DOWNSTAIRS_WORD), None
+    )
+
     if not args.ignore_wall_display:
-        fields = fetch_collection_fields(args.username, args.token)
         field_id = fields.get(DEFAULT_FIELD_NAME)
         if field_id is None:
             print(f'Warning: no custom field named "{DEFAULT_FIELD_NAME}" found. '
@@ -358,12 +392,20 @@ def main() -> None:
     picks = pick_albums(releases, args.count, history, args.cooldown_days)
     picks.sort(key=lambda r: normalize_artist(r["artist"]).lower())
 
+    for r in picks:
+        r["location"] = location(r, downstairs_field_id)
+
     print(f"=== {len(picks)} albums for the wall ===\n")
+    width = max(len(LOCATION_DOWNSTAIRS), len(LOCATION_OFFICE))
     for i, r in enumerate(picks, 1):
         year = f" ({r['year']})" if r["year"] else ""
         fmt = f" [{', '.join(r['formats'])}]" if r["formats"] else ""
-        print(f"{i:2}. {r['artist']} — {r['title']}{year}{fmt}")
-        print(f"    {r['url']}")
+        print(f"{i:2}. {r['location']:<{width}}  {r['artist']} — {r['title']}{year}{fmt}")
+        print(f"    {'':<{width}}  {r['url']}")
+
+    downstairs_count = sum(r["location"] == LOCATION_DOWNSTAIRS for r in picks)
+    print(f"\n{len(picks) - downstairs_count} in the {LOCATION_OFFICE.lower()}, "
+          f"{downstairs_count} {LOCATION_DOWNSTAIRS.lower()}.")
 
     if not args.no_history:
         today = date.today().isoformat()
